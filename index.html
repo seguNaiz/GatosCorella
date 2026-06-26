@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Control Bomba de Agua</title>
+
+  <!-- Cliente MQTT sobre WebSockets (gratuito, via CDN) -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --accent: #22c55e;
+      --accent-off: #475569;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .card {
+      background: var(--card);
+      padding: 2.5rem 3rem;
+      border-radius: 1.25rem;
+      box-shadow: 0 20px 40px rgba(0,0,0,.4);
+      text-align: center;
+      width: min(90vw, 360px);
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+    .subtitle { color: var(--muted); font-size: .85rem; margin-bottom: 2rem; }
+
+    /* Interruptor */
+    .switch { position: relative; display: inline-block; width: 120px; height: 64px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; cursor: pointer; inset: 0;
+      background: var(--accent-off);
+      transition: .3s; border-radius: 64px;
+    }
+    .slider:before {
+      content: "";
+      position: absolute; height: 52px; width: 52px; left: 6px; bottom: 6px;
+      background: #fff; transition: .3s; border-radius: 50%;
+    }
+    input:checked + .slider { background: var(--accent); }
+    input:checked + .slider:before { transform: translateX(56px); }
+    input:disabled + .slider { opacity: .5; cursor: not-allowed; }
+
+    .state { margin-top: 1.5rem; font-size: 1.1rem; font-weight: 600; }
+    .state.on  { color: var(--accent); }
+    .state.off { color: var(--muted); }
+
+    .conn {
+      margin-top: 1.5rem; font-size: .8rem; color: var(--muted);
+      display: flex; align-items: center; justify-content: center; gap: .4rem;
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; }
+    .dot.connected { background: var(--accent); }
+
+    .note { margin-top: 1.25rem; font-size: .72rem; color: var(--muted); line-height: 1.4; }
+
+    /* Login */
+    .hidden { display: none !important; }
+    .pwd {
+      width: 100%; padding: .8rem 1rem; margin-bottom: 1rem;
+      border: 1px solid #334155; border-radius: .6rem;
+      background: #0f172a; color: var(--text); font-size: 1rem; outline: none;
+    }
+    .pwd:focus { border-color: var(--accent); }
+    .btn {
+      width: 100%; padding: .8rem 1rem; border: none; border-radius: .6rem;
+      background: var(--accent); color: #052e16; font-size: 1rem; font-weight: 700;
+      cursor: pointer; transition: .2s;
+    }
+    .btn:hover { filter: brightness(1.05); }
+    .btn:disabled { background: var(--accent-off); color: var(--muted); cursor: not-allowed; }
+    .login-error { margin-top: 1rem; font-size: .8rem; color: #f87171; min-height: 1rem; }
+  </style>
+</head>
+<body>
+  <!-- Pantalla de acceso -->
+  <div class="card" id="loginCard">
+    <h1>Acceso</h1>
+    <div class="subtitle">Introduce la contraseña</div>
+    <input type="password" id="pwd" class="pwd" placeholder="Contraseña"
+           autocomplete="current-password" />
+    <button id="loginBtn" class="btn">Entrar</button>
+    <div class="login-error" id="loginError"></div>
+  </div>
+
+  <!-- Panel de control (oculto hasta validar la contraseña) -->
+  <div class="card hidden" id="controlCard">
+    <h1>Bomba de Agua</h1>
+    <div class="subtitle">Control remoto ESP32</div>
+
+    <label class="switch">
+      <input type="checkbox" id="toggle" disabled />
+      <span class="slider"></span>
+    </label>
+
+    <div class="state off" id="stateLabel">APAGADA</div>
+
+    <div class="conn">
+      <span class="dot" id="dot"></span>
+      <span id="connLabel">Conectando al broker...</span>
+    </div>
+
+    <div class="note">
+      Seguridad: la bomba se apaga sola a los 10&nbsp;s aunque dejes el
+      interruptor encendido.
+    </div>
+  </div>
+
+  <script>
+    // ===================================================================
+    // CONFIGURACION  (debe coincidir con la del firmware del ESP32)
+    // ===================================================================
+    const BROKER = "wss://broker.hivemq.com:8884/mqtt"; // WebSocket seguro
+    const SALT   = "bomba-salt::"; // debe coincidir con SECRET_SALT del ESP32
+    // ===================================================================
+
+    // --- Elementos de la interfaz ---
+    const loginCard   = document.getElementById("loginCard");
+    const controlCard = document.getElementById("controlCard");
+    const pwdInput    = document.getElementById("pwd");
+    const loginBtn    = document.getElementById("loginBtn");
+    const loginError  = document.getElementById("loginError");
+    const toggle      = document.getElementById("toggle");
+    const stateLabel  = document.getElementById("stateLabel");
+    const connLabel   = document.getElementById("connLabel");
+    const dot         = document.getElementById("dot");
+
+    let client = null;
+    let TOPIC_CMD = "";
+    let TOPIC_STATUS = "";
+    let verified = false;     // true cuando la contrasena es correcta
+    let verifyTimer = null;   // temporizador de validacion
+
+    // Deriva los topics MQTT a partir de la contrasena usando SHA-256.
+    // Sin la contrasena correcta no se puede conocer el topic.
+    async function deriveTopics(password) {
+      const data = new TextEncoder().encode(SALT + password);
+      const buf = await crypto.subtle.digest("SHA-256", data);
+      const hex = [...new Uint8Array(buf)]
+        .map(b => b.toString(16).padStart(2, "0")).join("");
+      const id = hex.slice(0, 20);
+      return { cmd: `bomba/${id}/cmd`, status: `bomba/${id}/status` };
+    }
+
+    // Intenta acceder con la contrasena introducida.
+    async function login() {
+      const pwd = pwdInput.value;
+      if (!pwd) return;
+
+      loginError.textContent = "";
+      loginBtn.disabled = true;
+      loginBtn.textContent = "Conectando...";
+
+      const topics = await deriveTopics(pwd);
+      TOPIC_CMD = topics.cmd;
+      TOPIC_STATUS = topics.status;
+
+      const clientId = "web-bomba-" + Math.random().toString(16).slice(2, 10);
+      client = mqtt.connect(BROKER, { clientId, clean: true });
+
+      client.on("connect", () => {
+        client.subscribe(TOPIC_STATUS);
+        if (!verified) {
+          // Esperamos el estado retenido del ESP32. Si llega, la contrasena
+          // es correcta; si no, mostramos error tras 5 s.
+          verifyTimer = setTimeout(() => {
+            loginError.textContent =
+              "Contraseña incorrecta o el ESP32 no está disponible.";
+            loginBtn.disabled = false;
+            loginBtn.textContent = "Entrar";
+            client.end(true);
+          }, 5000);
+        } else {
+          dot.classList.add("connected");
+          connLabel.textContent = "Conectado";
+          toggle.disabled = false;
+        }
+      });
+
+      client.on("message", (topic, payload) => {
+        if (topic !== TOPIC_STATUS) return;
+        if (!verified) {
+          verified = true;
+          clearTimeout(verifyTimer);
+          unlock();
+        }
+        updateUi(payload.toString().trim().toUpperCase() === "ON");
+      });
+
+      client.on("reconnect", () => {
+        if (!verified) return;
+        dot.classList.remove("connected");
+        connLabel.textContent = "Reconectando...";
+        toggle.disabled = true;
+      });
+
+      client.on("close", () => {
+        if (!verified) return;
+        dot.classList.remove("connected");
+        connLabel.textContent = "Desconectado";
+        toggle.disabled = true;
+      });
+
+      client.on("error", (err) => {
+        loginError.textContent = "Error: " + err.message;
+        loginBtn.disabled = false;
+        loginBtn.textContent = "Entrar";
+      });
+    }
+
+    // Muestra el panel de control tras validar la contrasena.
+    function unlock() {
+      loginCard.classList.add("hidden");
+      controlCard.classList.remove("hidden");
+      dot.classList.add("connected");
+      connLabel.textContent = "Conectado";
+      toggle.disabled = false;
+    }
+
+    // Eventos de la pantalla de login.
+    loginBtn.addEventListener("click", login);
+    pwdInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") login();
+    });
+
+    // Al accionar el interruptor, publica el comando correspondiente.
+    toggle.addEventListener("change", () => {
+      if (!client) return;
+      client.publish(TOPIC_CMD, toggle.checked ? "ON" : "OFF");
+    });
+
+    // Actualiza el aspecto visual del interruptor y la etiqueta de estado.
+    function updateUi(on) {
+      toggle.checked = on;
+      stateLabel.textContent = on ? "ENCENDIDA" : "APAGADA";
+      stateLabel.className = "state " + (on ? "on" : "off");
+    }
+  </script>
+</body>
+</html>
