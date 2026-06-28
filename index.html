@@ -85,6 +85,37 @@
     .btn:hover { filter: brightness(1.05); }
     .btn:disabled { background: var(--accent-off); color: var(--muted); cursor: not-allowed; }
     .login-error { margin-top: 1rem; font-size: .8rem; color: #f87171; min-height: 1rem; }
+
+    /* Pestanas */
+    .tabs { display: flex; gap: .5rem; margin-bottom: 1.5rem; }
+    .tab {
+      flex: 1; padding: .6rem; border: none; border-radius: .6rem;
+      background: #0f172a; color: var(--muted); font-size: .9rem; font-weight: 600;
+      cursor: pointer; transition: .2s;
+    }
+    .tab.active { background: var(--accent); color: #052e16; }
+
+    /* Nivel del tanque */
+    .level { margin-bottom: 1.5rem; }
+    .level-pct { font-size: 2.6rem; font-weight: 800; }
+    .level-bar {
+      height: 14px; background: #0f172a; border-radius: 8px; overflow: hidden;
+      margin: .6rem 0 .3rem;
+    }
+    .level-fill {
+      height: 100%; width: 0%; background: var(--accent);
+      transition: width .4s; border-radius: 8px;
+    }
+    .level-label { font-size: .75rem; color: var(--muted); }
+
+    /* Calibracion */
+    .dist-now { font-size: 2.2rem; font-weight: 800; margin-bottom: 1.5rem; }
+    .btn-cal { margin-bottom: .8rem; }
+    .cal-values {
+      display: flex; justify-content: space-between; margin-top: 1rem;
+      font-size: .85rem; color: var(--muted);
+    }
+    .cal-values b { color: var(--text); }
   </style>
 </head>
 <body>
@@ -100,15 +131,45 @@
 
   <!-- Panel de control (oculto hasta validar la contraseña) -->
   <div class="card hidden" id="controlCard">
-    <h1>Bomba de Agua</h1>
-    <div class="subtitle">Control remoto ESP32</div>
+    <div class="tabs">
+      <button class="tab active" id="tabMainBtn">Principal</button>
+      <button class="tab" id="tabCalBtn">Calibración</button>
+    </div>
 
-    <label class="switch">
-      <input type="checkbox" id="toggle" disabled />
-      <span class="slider"></span>
-    </label>
+    <!-- Pestaña principal -->
+    <div id="tabMain">
+      <h1>Bomba de Agua</h1>
+      <div class="subtitle">Gatitos felices</div>
 
-    <div class="state off" id="stateLabel">APAGADA</div>
+      <div class="level">
+        <div class="level-pct" id="levelPct">--%</div>
+        <div class="level-bar"><div class="level-fill" id="levelFill"></div></div>
+        <div class="level-label">Nivel del tanque</div>
+      </div>
+
+      <label class="switch">
+        <input type="checkbox" id="toggle" disabled />
+        <span class="slider"></span>
+      </label>
+
+      <div class="state off" id="stateLabel">APAGADA</div>
+    </div>
+
+    <!-- Pestaña de calibración -->
+    <div id="tabCal" class="hidden">
+      <h1>Calibración</h1>
+      <div class="subtitle">Distancia medida en tiempo real</div>
+
+      <div class="dist-now" id="distNow">-- cm</div>
+
+      <button class="btn btn-cal" id="calEmptyBtn">Guardar tanque VACÍO</button>
+      <button class="btn btn-cal" id="calFullBtn">Guardar tanque LLENO</button>
+
+      <div class="cal-values">
+        <span>Vacío: <b id="calEmptyVal">--</b> cm</span>
+        <span>Lleno: <b id="calFullVal">--</b> cm</span>
+      </div>
+    </div>
 
     <div class="conn">
       <span class="dot" id="dot"></span>
@@ -140,11 +201,31 @@
     const connLabel   = document.getElementById("connLabel");
     const dot         = document.getElementById("dot");
 
+    // Pestanas
+    const tabMainBtn  = document.getElementById("tabMainBtn");
+    const tabCalBtn   = document.getElementById("tabCalBtn");
+    const tabMain     = document.getElementById("tabMain");
+    const tabCal      = document.getElementById("tabCal");
+
+    // Nivel
+    const levelPct    = document.getElementById("levelPct");
+    const levelFill   = document.getElementById("levelFill");
+
+    // Calibracion
+    const distNow     = document.getElementById("distNow");
+    const calEmptyBtn = document.getElementById("calEmptyBtn");
+    const calFullBtn  = document.getElementById("calFullBtn");
+    const calEmptyVal = document.getElementById("calEmptyVal");
+    const calFullVal  = document.getElementById("calFullVal");
+
     let client = null;
     let TOPIC_CMD = "";
     let TOPIC_STATUS = "";
+    let TOPIC_TELEMETRY = "";
+    let TOPIC_WEB = "";
     let verified = false;     // true cuando la contrasena es correcta
     let verifyTimer = null;   // temporizador de validacion
+    let presenceTimer = null; // envio periodico de presencia
 
     // Deriva los topics MQTT a partir de la contrasena usando SHA-256.
     // Sin la contrasena correcta no se puede conocer el topic.
@@ -154,7 +235,12 @@
       const hex = [...new Uint8Array(buf)]
         .map(b => b.toString(16).padStart(2, "0")).join("");
       const id = hex.slice(0, 20);
-      return { cmd: `bomba/${id}/cmd`, status: `bomba/${id}/status` };
+      return {
+        cmd: `bomba/${id}/cmd`,
+        status: `bomba/${id}/status`,
+        telemetry: `bomba/${id}/telemetry`,
+        web: `bomba/${id}/web`,
+      };
     }
 
     // Intenta acceder con la contrasena introducida.
@@ -166,15 +252,18 @@
       loginBtn.disabled = true;
       loginBtn.textContent = "Conectando...";
 
-      const topics = await deriveTopics(pwd);
-      TOPIC_CMD = topics.cmd;
-      TOPIC_STATUS = topics.status;
+      const t = await deriveTopics(pwd);
+      TOPIC_CMD = t.cmd;
+      TOPIC_STATUS = t.status;
+      TOPIC_TELEMETRY = t.telemetry;
+      TOPIC_WEB = t.web;
 
       const clientId = "web-bomba-" + Math.random().toString(16).slice(2, 10);
       client = mqtt.connect(BROKER, { clientId, clean: true });
 
       client.on("connect", () => {
         client.subscribe(TOPIC_STATUS);
+        client.subscribe(TOPIC_TELEMETRY);
         if (!verified) {
           // Esperamos el estado retenido del ESP32. Si llega, la contrasena
           // es correcta; si no, mostramos error tras 5 s.
@@ -193,13 +282,17 @@
       });
 
       client.on("message", (topic, payload) => {
-        if (topic !== TOPIC_STATUS) return;
-        if (!verified) {
-          verified = true;
-          clearTimeout(verifyTimer);
-          unlock();
+        const text = payload.toString();
+        if (topic === TOPIC_STATUS) {
+          if (!verified) {
+            verified = true;
+            clearTimeout(verifyTimer);
+            unlock();
+          }
+          updateUi(text.trim().toUpperCase() === "ON");
+        } else if (topic === TOPIC_TELEMETRY) {
+          updateTelemetry(text);
         }
-        updateUi(payload.toString().trim().toUpperCase() === "ON");
       });
 
       client.on("reconnect", () => {
@@ -230,7 +323,48 @@
       dot.classList.add("connected");
       connLabel.textContent = "Conectado";
       toggle.disabled = false;
+      // Avisa al ESP32 de que la web esta activa (mantiene el modo normal).
+      sendPresence();
+      presenceTimer = setInterval(sendPresence, 5000);
     }
+
+    // Publica una senal de presencia para el modo de consumo del ESP32.
+    function sendPresence() {
+      if (client && client.connected) client.publish(TOPIC_WEB, "1");
+    }
+
+    // Procesa la telemetria recibida (JSON con dist, pct, empty, full).
+    function updateTelemetry(text) {
+      let d;
+      try { d = JSON.parse(text); } catch (e) { return; }
+
+      // Distancia actual (cm).
+      distNow.textContent =
+        (d.dist >= 0) ? d.dist.toFixed(1) + " cm" : "sin lectura";
+
+      // Porcentaje de llenado.
+      if (d.pct >= 0) {
+        levelPct.textContent = d.pct + "%";
+        levelFill.style.width = d.pct + "%";
+      } else {
+        levelPct.textContent = "--%";
+        levelFill.style.width = "0%";
+      }
+
+      // Valores de calibracion guardados.
+      calEmptyVal.textContent = (d.empty > 0) ? d.empty.toFixed(1) : "--";
+      calFullVal.textContent  = (d.full  > 0) ? d.full.toFixed(1)  : "--";
+    }
+
+    // Cambia entre las dos pestanas.
+    function showTab(main) {
+      tabMain.classList.toggle("hidden", !main);
+      tabCal.classList.toggle("hidden", main);
+      tabMainBtn.classList.toggle("active", main);
+      tabCalBtn.classList.toggle("active", !main);
+    }
+    tabMainBtn.addEventListener("click", () => showTab(true));
+    tabCalBtn.addEventListener("click", () => showTab(false));
 
     // Eventos de la pantalla de login.
     loginBtn.addEventListener("click", login);
@@ -242,6 +376,14 @@
     toggle.addEventListener("change", () => {
       if (!client) return;
       client.publish(TOPIC_CMD, toggle.checked ? "ON" : "OFF");
+    });
+
+    // Botones de calibracion: el ESP32 mide y guarda el valor en flash.
+    calEmptyBtn.addEventListener("click", () => {
+      if (client) client.publish(TOPIC_CMD, "CAL_EMPTY");
+    });
+    calFullBtn.addEventListener("click", () => {
+      if (client) client.publish(TOPIC_CMD, "CAL_FULL");
     });
 
     // Actualiza el aspecto visual del interruptor y la etiqueta de estado.
