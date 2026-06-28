@@ -116,6 +116,24 @@
       font-size: .85rem; color: var(--muted);
     }
     .cal-values b { color: var(--text); }
+
+    /* Interruptor de proteccion (compacto) */
+    .prot-row {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 1.5rem; font-size: .85rem; text-align: left;
+    }
+    .switch-sm { position: relative; display: inline-block; width: 46px; height: 26px; flex: none; }
+    .switch-sm input { opacity: 0; width: 0; height: 0; }
+    .slider-sm {
+      position: absolute; cursor: pointer; inset: 0;
+      background: var(--accent-off); transition: .3s; border-radius: 26px;
+    }
+    .slider-sm:before {
+      content: ""; position: absolute; height: 20px; width: 20px; left: 3px; bottom: 3px;
+      background: #fff; transition: .3s; border-radius: 50%;
+    }
+    .switch-sm input:checked + .slider-sm { background: var(--accent); }
+    .switch-sm input:checked + .slider-sm:before { transform: translateX(20px); }
   </style>
 </head>
 <body>
@@ -169,6 +187,14 @@
         <span>Vacío: <b id="calEmptyVal">--</b> cm</span>
         <span>Lleno: <b id="calFullVal">--</b> cm</span>
       </div>
+
+      <div class="prot-row">
+        <span>Proteger nivel mínimo<br><small style="color:var(--muted)">No deja encender la bomba si está vacío</small></span>
+        <label class="switch-sm">
+          <input type="checkbox" id="protToggle" checked />
+          <span class="slider-sm"></span>
+        </label>
+      </div>
     </div>
 
     <div class="conn">
@@ -217,6 +243,7 @@
     const calFullBtn  = document.getElementById("calFullBtn");
     const calEmptyVal = document.getElementById("calEmptyVal");
     const calFullVal  = document.getElementById("calFullVal");
+    const protToggle  = document.getElementById("protToggle");
 
     let client = null;
     let TOPIC_CMD = "";
@@ -354,6 +381,9 @@
       // Valores de calibracion guardados.
       calEmptyVal.textContent = (d.empty > 0) ? d.empty.toFixed(1) : "--";
       calFullVal.textContent  = (d.full  > 0) ? d.full.toFixed(1)  : "--";
+
+      // Estado de la proteccion de nivel minimo.
+      if (d.prot !== undefined) protToggle.checked = (d.prot == 1);
     }
 
     // Cambia entre las dos pestanas.
@@ -384,6 +414,11 @@
     });
     calFullBtn.addEventListener("click", () => {
       if (client) client.publish(TOPIC_CMD, "CAL_FULL");
+    });
+
+    // Interruptor de proteccion de nivel minimo.
+    protToggle.addEventListener("change", () => {
+      if (client) client.publish(TOPIC_CMD, protToggle.checked ? "PROT_ON" : "PROT_OFF");
     });
 
     // Actualiza el aspecto visual del interruptor y la etiqueta de estado.
